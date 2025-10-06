@@ -1,0 +1,920 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Enhanced 5-10 EMA Cross Trading Bot - AWS EC2 Ready
+Run this on AWS EC2 for 24/7 trading
+"""
+
+import os
+import sys
+import pandas as pd
+import numpy as np
+import asyncio
+import logging
+import time
+import threading
+from datetime import datetime, timedelta
+from collections import deque
+from typing import Dict, Optional
+import warnings
+import requests
+import pytz
+import atexit
+import schedule
+import signal
+
+warnings.filterwarnings('ignore')
+
+# ============================================================================
+# CONFIGURATION - EDIT THESE OR USE ENVIRONMENT VARIABLES
+# ============================================================================
+
+# Option 1: Hardcode credentials (less secure)
+ALPACA_API_KEY = os.environ.get("ALPACA_API_KEY", "PK4GHAEV9QGS2MPDABJ8")
+ALPACA_SECRET_KEY = os.environ.get("ALPACA_SECRET_KEY", "DqBWQy5THXhgLmrsGTtZNOYmhjo8eaI7yyrHHKy4")
+ALPACA_BASE_URL = os.environ.get("ALPACA_BASE_URL", "https://paper-api.alpaca.markets")
+
+DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL", "https://discord.com/api/webhooks/1414722189529448551/xt8TBox1-w7WQ9ZMW9iCW4twLM7UtBXFpZJ96-KmAFtJ926C9z8L2IIyI3SOJCQbDh9i")
+
+# ============================================================================
+
+daily_trades = []
+
+# AWS-friendly logging (writes to file AND console)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s",
+    handlers=[
+        logging.FileHandler("/var/log/trading_bot.log"),  # AWS log file
+        logging.StreamHandler(sys.stdout)  # Console output
+    ]
+)
+logger = logging.getLogger(__name__)
+
+# Import Alpaca
+try:
+    import alpaca_trade_api as tradeapi
+    from alpaca_trade_api.stream import Stream
+    ALPACA_AVAILABLE = True
+    logger.info("✓ Alpaca Trade API loaded")
+except ImportError as e:
+    logger.error(f"✗ Alpaca import failed: {e}")
+    logger.error("Install with: pip3 install alpaca-trade-api")
+    ALPACA_AVAILABLE = False
+    sys.exit(1)
+
+
+# ============================================================================
+# DISCORD ALERT SYSTEM
+# ============================================================================
+
+def send_discord_embed(message, title="Trading Bot", color=3447003, fields=None):
+    """Send rich embed to Discord"""
+    if not DISCORD_WEBHOOK_URL:
+        return
+    
+    embed = {
+        "title": title,
+        "description": message,
+        "color": color,
+        "timestamp": datetime.utcnow().isoformat(),
+        "footer": {"text": "Enhanced EMA Bot - AWS EC2"}
+    }
+    
+    if fields:
+        embed["fields"] = fields
+    
+    try:
+        requests.post(DISCORD_WEBHOOK_URL, json={"embeds": [embed]}, timeout=10)
+    except Exception as e:
+        logger.warning(f"Discord send failed: {e}")
+
+
+def bot_start_alert(bot):
+    """Alert when bot starts"""
+    try:
+        account = bot.api.get_account()
+        portfolio = float(account.portfolio_value)
+        buying_power = float(account.buying_power)
+        
+        # Get server info
+        import socket
+        hostname = socket.gethostname()
+        
+        fields = [
+            {"name": "🖥️ Server", "value": hostname, "inline": True},
+            {"name": "💰 Portfolio", "value": f"${portfolio:,.2f}", "inline": True},
+            {"name": "💵 Buying Power", "value": f"${buying_power:,.2f}", "inline": True},
+            {"name": "🎯 Threshold", "value": str(bot.signal_threshold), "inline": True},
+            {"name": "🔒 Stop Loss", "value": f"{bot.stop_loss*100:.1f}%", "inline": True},
+            {"name": "🎯 Take Profit 1", "value": f"{bot.take_profit_1*100:.1f}%", "inline": True},
+            {"name": "🎯 Take Profit 2", "value": f"{bot.take_profit_2*100:.1f}%", "inline": True},
+            {"name": "📊 Symbols", "value": ", ".join(bot.symbols), "inline": False}
+        ]
+        
+        mode = "PAPER" if "paper" in ALPACA_BASE_URL else "LIVE"
+        
+        send_discord_embed(
+            f"✅ Trading bot started on AWS EC2\n**Mode: {mode} Trading**",
+            title="🤖 Bot Started - AWS",
+            color=3066993,
+            fields=fields
+        )
+    except Exception as e:
+        logger.error(f"Start alert error: {e}")
+
+
+def bot_stop_alert(reason="Manual shutdown"):
+    """Alert when bot stops"""
+    send_discord_embed(
+        f"⛔ Trading bot stopped on AWS\n**Reason: {reason}**",
+        title="🛑 Bot Stopped - AWS",
+        color=15105570
+    )
+
+
+def bot_error_alert(error_msg):
+    """Alert when bot encounters critical error"""
+    send_discord_embed(
+        f"🚨 **Critical Error**\n```{error_msg}```\nBot may have crashed. Check AWS EC2 instance.",
+        title="⚠️ Bot Error - AWS",
+        color=15158332  # Orange
+    )
+
+
+def trade_open_alert(symbol, side, entry_price, qty, indicators=None):
+    """Alert when opening trade"""
+    trade = {
+        "symbol": symbol,
+        "side": side,
+        "entry": entry_price,
+        "exit": None,
+        "qty": qty,
+        "pl": None,
+        "open_time": datetime.now().strftime("%H:%M:%S"),
+        "open_datetime": datetime.now()
+    }
+    daily_trades.append(trade)
+    
+    fields = [
+        {"name": "💵 Entry", "value": f"${entry_price:.2f}", "inline": True},
+        {"name": "📦 Quantity", "value": str(qty), "inline": True},
+        {"name": "💰 Value", "value": f"${entry_price * qty:,.2f}", "inline": True}
+    ]
+    
+    if indicators:
+        fields.extend([
+            {"name": "📊 RSI", "value": f"{indicators.get('RSI', 0):.1f}", "inline": True},
+            {"name": "📈 MACD", "value": f"{indicators.get('MACD', 0):.3f}", "inline": True},
+            {"name": "📉 EMA 5/10", "value": f"{indicators.get('EMA_5', 0):.2f}/{indicators.get('EMA_10', 0):.2f}", "inline": True}
+        ])
+    
+    emoji = "🟢" if side.lower() == "buy" else "🔴"
+    send_discord_embed(
+        f"{emoji} **{side.upper()} {symbol}**\nOpened new position",
+        title=f"📈 New {side.upper()} Trade",
+        color=3066993,
+        fields=fields
+    )
+
+
+def trade_close_alert(symbol, exit_price, exit_reason="Manual"):
+    """Alert when closing trade"""
+    for trade in daily_trades:
+        if trade["symbol"] == symbol and trade["exit"] is None:
+            trade["exit"] = exit_price
+            trade["exit_reason"] = exit_reason
+            
+            if trade["side"].lower() == "buy":
+                trade["pl"] = (exit_price - trade["entry"]) * trade["qty"]
+                trade["pl_pct"] = ((exit_price - trade["entry"]) / trade["entry"]) * 100
+            else:
+                trade["pl"] = (trade["entry"] - exit_price) * trade["qty"]
+                trade["pl_pct"] = ((trade["entry"] - exit_price) / trade["entry"]) * 100
+            
+            trade["close_time"] = datetime.now().strftime("%H:%M:%S")
+            trade["duration"] = str(datetime.now() - trade["open_datetime"]).split('.')[0]
+            
+            result_emoji = "✅" if trade["pl"] > 0 else "❌"
+            result_text = "PROFIT" if trade["pl"] > 0 else "LOSS"
+            
+            fields = [
+                {"name": "📥 Entry", "value": f"${trade['entry']:.2f}", "inline": True},
+                {"name": "📤 Exit", "value": f"${exit_price:.2f}", "inline": True},
+                {"name": "📦 Qty", "value": str(trade["qty"]), "inline": True},
+                {"name": "💰 P&L", "value": f"${trade['pl']:+,.2f}", "inline": True},
+                {"name": "📊 P&L %", "value": f"{trade['pl_pct']:+.2f}%", "inline": True},
+                {"name": "⏱️ Duration", "value": trade["duration"], "inline": True},
+                {"name": "🚪 Exit", "value": exit_reason, "inline": False}
+            ]
+            
+            send_discord_embed(
+                f"{result_emoji} **{result_text}** | {trade['side'].upper()} {symbol}",
+                title="💼 Trade Closed",
+                color=15105570 if trade["pl"] < 0 else 3066993,
+                fields=fields
+            )
+            break
+
+
+def hourly_status_alert(bot):
+    """Hourly status update"""
+    try:
+        account = bot.api.get_account()
+        portfolio = float(account.portfolio_value)
+        buying_power = float(account.buying_power)
+        
+        active_positions = sum(1 for pos in bot.positions.values() if pos['qty'] != 0)
+        uptime = datetime.now() - bot.bot_start_time
+        
+        fields = [
+            {"name": "💰 Portfolio", "value": f"${portfolio:,.2f}", "inline": True},
+            {"name": "💵 Buying Power", "value": f"${buying_power:,.2f}", "inline": True},
+            {"name": "📊 Positions", "value": str(active_positions), "inline": True},
+            {"name": "📈 Bars", "value": f"{bot.total_bars_received:,}", "inline": True},
+            {"name": "🎯 Signals", "value": str(bot.total_signals_generated), "inline": True},
+            {"name": "💼 Trades", "value": str(bot.total_trades_executed), "inline": True},
+            {"name": "🔒 SL Exits", "value": str(bot.stats['sl_exits']), "inline": True},
+            {"name": "🎯 PT Exits", "value": str(bot.stats['pt_exits']), "inline": True},
+            {"name": "⏱️ Uptime", "value": str(uptime).split('.')[0], "inline": True}
+        ]
+        
+        position_info = []
+        for symbol, pos in bot.positions.items():
+            if pos['qty'] != 0:
+                price = bot.stats['last_price_per_symbol'][symbol]
+                pnl_pct = (price - pos['entry_price']) / pos['entry_price'] * 100
+                position_info.append(f"• **{symbol}**: {pos['qty']} shares ({pnl_pct:+.1f}%)")
+        
+        if position_info:
+            fields.append({"name": "📊 Open Positions", "value": "\n".join(position_info), "inline": False})
+        
+        send_discord_embed(
+            "📊 Bot running on AWS",
+            title="⏰ Hourly Status",
+            color=3447003,
+            fields=fields
+        )
+    except Exception as e:
+        logger.error(f"Hourly alert error: {e}")
+
+
+def send_eod_summary():
+    """Enhanced end of day summary"""
+    eastern = pytz.timezone('US/Eastern')
+    now_et = datetime.now(eastern)
+    
+    closed_trades = [t for t in daily_trades if t.get("pl") is not None]
+    open_trades = [t for t in daily_trades if t.get("pl") is None]
+    
+    total_closed_pl = sum(t["pl"] for t in closed_trades) if closed_trades else 0
+    wins = sum(1 for t in closed_trades if t["pl"] > 0)
+    losses = sum(1 for t in closed_trades if t["pl"] < 0)
+    win_rate = (wins / len(closed_trades) * 100) if closed_trades else 0
+    
+    avg_win = (sum(t["pl"] for t in closed_trades if t["pl"] > 0) / wins) if wins > 0 else 0
+    avg_loss = (sum(t["pl"] for t in closed_trades if t["pl"] < 0) / losses) if losses > 0 else 0
+    
+    summary_text = f"**📊 End of Day Report - {now_et.strftime('%B %d, %Y')}**\n\n"
+    
+    fields = [
+        {"name": "📈 Total Trades", "value": str(len(daily_trades)), "inline": True},
+        {"name": "✅ Closed", "value": str(len(closed_trades)), "inline": True},
+        {"name": "🔄 Still Open", "value": str(len(open_trades)), "inline": True},
+    ]
+    
+    if closed_trades:
+        fields.extend([
+            {"name": "🎯 Wins", "value": str(wins), "inline": True},
+            {"name": "❌ Losses", "value": str(losses), "inline": True},
+            {"name": "📊 Win Rate", "value": f"{win_rate:.1f}%", "inline": True},
+            {"name": "💰 Total P&L", "value": f"${total_closed_pl:+,.2f}", "inline": True},
+            {"name": "📈 Avg Win", "value": f"${avg_win:+,.2f}", "inline": True},
+            {"name": "📉 Avg Loss", "value": f"${avg_loss:+,.2f}", "inline": True}
+        ])
+    
+    if closed_trades:
+        closed_details = []
+        for t in closed_trades[:5]:
+            emoji = "✅" if t["pl"] > 0 else "❌"
+            closed_details.append(
+                f"{emoji} **{t['symbol']}** {t['side'].upper()}\n"
+                f"   Entry: ${t['entry']:.2f} → Exit: ${t['exit']:.2f}\n"
+                f"   P&L: **${t['pl']:+,.2f}** ({t['pl_pct']:+.2f}%)\n"
+                f"   Reason: {t.get('exit_reason', 'Manual')}\n"
+                f"   Duration: {t.get('duration', 'N/A')}"
+            )
+        
+        closed_text = "\n\n".join(closed_details)
+        if len(closed_trades) > 5:
+            closed_text += f"\n\n*...and {len(closed_trades) - 5} more*"
+        
+        fields.append({"name": "💼 Closed Trades", "value": closed_text, "inline": False})
+    
+    if open_trades:
+        open_details = []
+        for t in open_trades:
+            open_details.append(
+                f"🔄 **{t['symbol']}** {t['side'].upper()}\n"
+                f"   Entry: ${t['entry']:.2f} @ {t['open_time']}\n"
+                f"   Qty: {t['qty']} shares\n"
+                f"   Status: **Still Holding**"
+            )
+        
+        open_text = "\n\n".join(open_details)
+        fields.append({"name": "📊 Open Positions", "value": open_text, "inline": False})
+    
+    summary_text += f"Total Trades: **{len(daily_trades)}** | Closed: **{len(closed_trades)}** | Open: **{len(open_trades)}**\n"
+    
+    if closed_trades:
+        summary_text += f"\n**Realized P&L: ${total_closed_pl:+,.2f}**"
+    
+    if not daily_trades:
+        summary_text = "No trading activity today."
+        fields = [{"name": "📊 Status", "value": "No Trades", "inline": True}]
+    
+    if total_closed_pl > 0:
+        color = 3066993
+        title = "📊 End of Day - Profitable! ✅"
+    elif total_closed_pl < 0:
+        color = 15105570
+        title = "📊 End of Day - Loss ❌"
+    else:
+        color = 9807270
+        title = "📊 End of Day Summary"
+    
+    send_discord_embed(summary_text, title=title, color=color, fields=fields)
+    
+    # Clear daily trades for next day
+    daily_trades.clear()
+
+
+schedule.every().day.at("20:00").do(send_eod_summary)
+
+
+# ============================================================================
+# TRADING BOT CLASS
+# ============================================================================
+
+class LiveTradingBot:
+    def __init__(self, initial_capital=250000, risk_per_trade=0.01):
+        self.initial_capital = initial_capital
+        self.risk_per_trade = risk_per_trade
+        self.max_position_size = initial_capital * 0.15
+        
+        self.stop_loss = 0.008
+        self.take_profit_1 = 0.015
+        self.take_profit_2 = 0.025
+        self.trailing_stop = 0.005
+        
+        self.signal_threshold = 4
+        
+        self.symbol_data = {}
+        self.max_bars = 200
+        self.positions = {}
+        self.pending_orders = {}
+        
+        self.symbols = ['GOOGL', 'PDD', 'MSFT', 'APP', 'PEP', 'AVGO', 'RDDT', 'CAT', 'LMT']
+        
+        self.bot_start_time = datetime.now()
+        self.last_activity_time = datetime.now()
+        self.last_hourly_alert = datetime.now()
+        self.total_bars_received = 0
+        self.total_signals_generated = 0
+        self.total_trades_executed = 0
+        self.is_running = False
+        self.status_thread = None
+        
+        self.stats = {
+            'bars_per_symbol': {},
+            'signals_per_symbol': {},
+            'trades_per_symbol': {},
+            'last_price_per_symbol': {},
+            'connection_status': 'Disconnected',
+            'sl_exits': 0,
+            'pt_exits': 0,
+            'after_hours_bars': 0,
+            'market_hours_bars': 0
+        }
+        
+        for symbol in self.symbols:
+            self.symbol_data[symbol] = deque(maxlen=self.max_bars)
+            self.positions[symbol] = {
+                'qty': 0,
+                'entry_price': 0,
+                'entry_time': None,
+                'highest_price': 0,
+                'type': None
+            }
+            self.stats['bars_per_symbol'][symbol] = 0
+            self.stats['signals_per_symbol'][symbol] = 0
+            self.stats['trades_per_symbol'][symbol] = 0
+            self.stats['last_price_per_symbol'][symbol] = 0.0
+        
+        self.api = None
+        self.stream = None
+        self.setup_alpaca_connection()
+
+    def is_market_hours(self) -> bool:
+        try:
+            eastern = pytz.timezone('US/Eastern')
+            now_et = datetime.now(eastern)
+            
+            if now_et.weekday() >= 5:
+                return False
+            
+            market_open = now_et.replace(hour=9, minute=30, second=0, microsecond=0)
+            market_close = now_et.replace(hour=16, minute=0, second=0, microsecond=0)
+            
+            return market_open <= now_et <= market_close
+        except:
+            return True
+
+    def setup_alpaca_connection(self):
+        if not ALPACA_AVAILABLE:
+            return
+        
+        try:
+            self.api = tradeapi.REST(
+                key_id=ALPACA_API_KEY,
+                secret_key=ALPACA_SECRET_KEY,
+                base_url=ALPACA_BASE_URL
+            )
+            
+            account = self.api.get_account()
+            logger.info(f"✓ Connected to Alpaca - Status: {account.status}")
+            
+            self.stream = Stream(
+                ALPACA_API_KEY,
+                ALPACA_SECRET_KEY,
+                base_url=ALPACA_BASE_URL,
+                data_feed='iex'
+            )
+        except Exception as e:
+            logger.error(f"Alpaca connection failed: {e}")
+            bot_error_alert(f"Alpaca connection failed: {e}")
+            self.api = None
+            self.stream = None
+
+    def calculate_indicators(self, symbol: str) -> Optional[Dict]:
+        if symbol not in self.symbol_data or len(self.symbol_data[symbol]) < 50:
+            return None
+        
+        bars_list = list(self.symbol_data[symbol])
+        df = pd.DataFrame(bars_list)
+        
+        if df.empty or len(df) < 50:
+            return None
+        
+        try:
+            df['EMA_5'] = df['close'].ewm(span=5, adjust=False).mean()
+            df['EMA_10'] = df['close'].ewm(span=10, adjust=False).mean()
+            df['EMA_20'] = df['close'].ewm(span=20, adjust=False).mean()
+            df['EMA_50'] = df['close'].ewm(span=50, adjust=False).mean()
+            
+            exp1 = df['close'].ewm(span=12, adjust=False).mean()
+            exp2 = df['close'].ewm(span=26, adjust=False).mean()
+            df['MACD'] = exp1 - exp2
+            df['MACD_signal'] = df['MACD'].ewm(span=9, adjust=False).mean()
+            df['MACD_histogram'] = df['MACD'] - df['MACD_signal']
+            
+            delta = df['close'].diff()
+            gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
+            loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
+            rs = gain / loss
+            df['RSI'] = 100 - (100 / (1 + rs))
+            
+            df['high_low'] = df['high'] - df['low']
+            df['high_close'] = abs(df['high'] - df['close'].shift())
+            df['low_close'] = abs(df['low'] - df['close'].shift())
+            df['tr'] = df[['high_low', 'high_close', 'low_close']].max(axis=1)
+            df['ATR'] = df['tr'].rolling(window=14).mean()
+            
+            df['volume_sma'] = df['volume'].rolling(window=20).mean()
+            df['volume_ratio'] = df['volume'] / df['volume_sma']
+            
+            latest = df.iloc[-1]
+            prev = df.iloc[-2] if len(df) > 1 else latest
+            
+            return {
+                'close': latest['close'],
+                'EMA_5': latest['EMA_5'],
+                'EMA_10': latest['EMA_10'],
+                'EMA_20': latest['EMA_20'],
+                'EMA_50': latest['EMA_50'],
+                'MACD': latest['MACD'],
+                'MACD_signal': latest['MACD_signal'],
+                'MACD_histogram': latest['MACD_histogram'],
+                'RSI': latest['RSI'],
+                'ATR': latest['ATR'],
+                'volume_ratio': latest['volume_ratio'],
+                'prev_EMA_5': prev['EMA_5'],
+                'prev_EMA_10': prev['EMA_10'],
+                'prev_MACD': prev['MACD'],
+                'prev_MACD_signal': prev['MACD_signal']
+            }
+        except Exception as e:
+            logger.error(f"Indicator error {symbol}: {e}")
+            return None
+
+    def generate_signal(self, symbol: str, indicators: Dict) -> int:
+        try:
+            ema_5_cross_above = (indicators['EMA_5'] > indicators['EMA_10'] and indicators['prev_EMA_5'] <= indicators['prev_EMA_10'])
+            ema_5_cross_below = (indicators['EMA_5'] < indicators['EMA_10'] and indicators['prev_EMA_5'] >= indicators['prev_EMA_10'])
+            
+            macd_bullish = indicators['MACD'] > indicators['MACD_signal']
+            macd_bearish = indicators['MACD'] < indicators['MACD_signal']
+            
+            price_above_20ema = indicators['close'] > indicators['EMA_20']
+            price_below_20ema = indicators['close'] < indicators['EMA_20']
+            
+            rsi_neutral = 30 < indicators['RSI'] < 70
+            volume_above_avg = indicators['volume_ratio'] > 1.1
+            
+            strong_uptrend = (indicators['EMA_5'] > indicators['EMA_10'] > indicators['EMA_20'] > indicators['EMA_50'])
+            strong_downtrend = (indicators['EMA_5'] < indicators['EMA_10'] < indicators['EMA_20'] < indicators['EMA_50'])
+            
+            buy_score = 0
+            sell_score = 0
+            
+            if ema_5_cross_above:
+                buy_score += 3
+            if macd_bullish:
+                buy_score += 2
+            if price_above_20ema:
+                buy_score += 1
+            if strong_uptrend:
+                buy_score += 2
+            if rsi_neutral:
+                buy_score += 1
+            if volume_above_avg:
+                buy_score += 1
+            
+            if ema_5_cross_below:
+                sell_score += 3
+            if macd_bearish:
+                sell_score += 2
+            if price_below_20ema:
+                sell_score += 1
+            if strong_downtrend:
+                sell_score += 2
+            if rsi_neutral:
+                sell_score += 1
+            if volume_above_avg:
+                sell_score += 1
+            
+            if buy_score >= self.signal_threshold or sell_score >= self.signal_threshold:
+                self.total_signals_generated += 1
+                self.stats['signals_per_symbol'][symbol] += 1
+            
+            if buy_score >= self.signal_threshold:
+                logger.info(f"🟢 BUY: {symbol} | Score: {buy_score}/{self.signal_threshold} | RSI: {indicators['RSI']:.1f}")
+                return 1
+            elif sell_score >= self.signal_threshold:
+                logger.info(f"🔴 SELL: {symbol} | Score: {sell_score}/{self.signal_threshold} | RSI: {indicators['RSI']:.1f}")
+                return -1
+            else:
+                return 0
+        except Exception as e:
+            logger.error(f"Signal error {symbol}: {e}")
+            return 0
+
+    def calculate_position_size(self, symbol: str, current_price: float, atr: float) -> int:
+        try:
+            account = self.api.get_account()
+            buying_power = float(account.buying_power)
+            
+            risk_amount = min(buying_power * self.risk_per_trade, self.max_position_size * self.risk_per_trade)
+            stop_distance = max(atr * 2, current_price * self.stop_loss)
+            position_size = int(risk_amount / stop_distance)
+            
+            max_shares = int(self.max_position_size / current_price)
+            position_size = min(position_size, max_shares)
+            
+            max_affordable = int(buying_power * 0.95 / current_price)
+            position_size = min(position_size, max_affordable)
+            
+            return max(position_size, 0)
+        except Exception as e:
+            logger.error(f"Position size error {symbol}: {e}")
+            return 0
+
+    def place_order(self, symbol: str, qty: int, side: str, current_price: float, indicators: Dict = None) -> Optional[str]:
+        try:
+            if qty <= 0:
+                return None
+            
+            order = self.api.submit_order(
+                symbol=symbol,
+                qty=qty,
+                side=side,
+                type='market',
+                time_in_force='day'
+            )
+            
+            logger.info(f"📤 ORDER: {side.upper()} {qty} {symbol} @ ${current_price:.2f}")
+            
+            self.total_trades_executed += 1
+            self.stats['trades_per_symbol'][symbol] += 1
+            
+            self.pending_orders[symbol] = {
+                'order_id': order.id,
+                'side': side,
+                'qty': qty,
+                'price': current_price,
+                'timestamp': datetime.now()
+            }
+            
+            if side.lower() == 'buy':
+                trade_open_alert(symbol, side, current_price, qty, indicators)
+            
+            return order.id
+        except Exception as e:
+            logger.error(f"Order error {symbol}: {e}")
+            return None
+
+    def check_exit_conditions(self, symbol: str, current_price: float) -> Optional[str]:
+        position = self.positions[symbol]
+        
+        if position['qty'] == 0:
+            return None
+        
+        try:
+            if position['type'] == 'LONG':
+                if current_price > position['highest_price']:
+                    position['highest_price'] = current_price
+                
+                pnl_pct = (current_price - position['entry_price']) / position['entry_price']
+                
+                if pnl_pct <= -self.stop_loss:
+                    self.stats['sl_exits'] += 1
+                    return "Stop Loss"
+                
+                if pnl_pct >= self.take_profit_2:
+                    self.stats['pt_exits'] += 1
+                    return "Take Profit 2"
+                
+                if pnl_pct >= self.take_profit_1:
+                    self.stats['pt_exits'] += 1
+                    return "Take Profit 1"
+                
+                if pnl_pct > 0.005:
+                    if current_price < position['highest_price'] * (1 - self.trailing_stop):
+                        return "Trailing Stop"
+            
+            return None
+        except Exception as e:
+            logger.error(f"Exit check error {symbol}: {e}")
+            return None
+
+    def update_position(self, symbol: str, qty: int, price: float, side: str):
+        position = self.positions[symbol]
+        
+        if side == 'buy':
+            position['qty'] = qty
+            position['entry_price'] = price
+            position['entry_time'] = datetime.now()
+            position['highest_price'] = price
+            position['type'] = 'LONG'
+            logger.info(f"✅ OPENED: {qty} {symbol} @ ${price:.2f}")
+        elif side == 'sell':
+            if position['qty'] > 0:
+                pnl = position['qty'] * (price - position['entry_price'])
+                pnl_pct = (price - position['entry_price']) / position['entry_price'] * 100
+                logger.info(f"✅ CLOSED: {symbol} | P&L: ${pnl:.2f} ({pnl_pct:+.2f}%)")
+            
+            position['qty'] = 0
+            position['entry_price'] = 0
+            position['entry_time'] = None
+            position['highest_price'] = 0
+            position['type'] = None
+
+    async def bar_callback(self, bar):
+        try:
+            symbol = bar.symbol
+            
+            self.last_activity_time = datetime.now()
+            self.total_bars_received += 1
+            self.stats['bars_per_symbol'][symbol] += 1
+            self.stats['last_price_per_symbol'][symbol] = bar.close
+            
+            if self.is_market_hours():
+                self.stats['market_hours_bars'] += 1
+            else:
+                self.stats['after_hours_bars'] += 1
+            
+            bar_data = {
+                'timestamp': bar.timestamp,
+                'open': bar.open,
+                'high': bar.high,
+                'low': bar.low,
+                'close': bar.close,
+                'volume': bar.volume
+            }
+            self.symbol_data[symbol].append(bar_data)
+            
+            indicators = self.calculate_indicators(symbol)
+            if not indicators:
+                return
+            
+            current_price = bar.close
+            
+            exit_reason = self.check_exit_conditions(symbol, current_price)
+            if exit_reason and self.positions[symbol]['qty'] != 0:
+                logger.info(f"🚪 EXIT: {symbol} - {exit_reason} | ${current_price:.2f}")
+                
+                qty = abs(self.positions[symbol]['qty'])
+                order_id = self.place_order(symbol, qty, 'sell', current_price)
+                
+                if order_id:
+                    trade_close_alert(symbol, current_price, exit_reason)
+                    self.update_position(symbol, 0, current_price, 'sell')
+                return
+            
+            if self.positions[symbol]['qty'] == 0 and self.is_market_hours():
+                signal = self.generate_signal(symbol, indicators)
+                
+                if signal == 1:
+                    qty = self.calculate_position_size(symbol, current_price, indicators['ATR'])
+                    
+                    if qty > 0:
+                        order_id = self.place_order(symbol, qty, 'buy', current_price, indicators)
+                        if order_id:
+                            self.update_position(symbol, qty, current_price, 'buy')
+            
+            if (datetime.now() - self.last_hourly_alert).total_seconds() >= 3600:
+                hourly_status_alert(self)
+                self.last_hourly_alert = datetime.now()
+            
+            schedule.run_pending()
+        
+        except Exception as e:
+            logger.error(f"Bar callback error: {e}")
+
+    def print_status_aws(self):
+        """AWS-friendly status display (no screen clearing)"""
+        while self.is_running:
+            try:
+                current_time = datetime.now()
+                uptime = current_time - self.bot_start_time
+                
+                market_open = self.is_market_hours()
+                market_status = "🟢 OPEN" if market_open else "🔴 CLOSED"
+                
+                try:
+                    account = self.api.get_account()
+                    portfolio_value = float(account.portfolio_value)
+                    buying_power = float(account.buying_power)
+                except:
+                    portfolio_value = 0
+                    buying_power = 0
+                
+                active_positions = sum(1 for pos in self.positions.values() if pos['qty'] != 0)
+                
+                logger.info("=" * 80)
+                logger.info(f"BOT STATUS | {current_time.strftime('%Y-%m-%d %H:%M:%S')} | Market: {market_status}")
+                logger.info(f"Uptime: {str(uptime).split('.')[0]} | Connection: {self.stats['connection_status']}")
+                logger.info(f"Portfolio: ${portfolio_value:,.2f} | Buying Power: ${buying_power:,.2f} | Positions: {active_positions}")
+                logger.info(f"Bars: {self.total_bars_received:,} | Signals: {self.total_signals_generated} | Trades: {self.total_trades_executed}")
+                logger.info(f"SL Exits: {self.stats['sl_exits']} | PT Exits: {self.stats['pt_exits']}")
+                logger.info("=" * 80)
+                
+                time.sleep(300)  # Log status every 5 minutes on AWS
+                
+            except Exception as e:
+                logger.error(f"Status display error: {e}")
+                time.sleep(300)
+
+    def start_status_monitor(self):
+        self.status_thread = threading.Thread(target=self.print_status_aws, daemon=True)
+        self.status_thread.start()
+
+    def start_streaming(self):
+        if not self.stream:
+            logger.error("Stream not initialized")
+            return
+        
+        self.is_running = True
+        self.start_status_monitor()
+        
+        try:
+            for symbol in self.symbols:
+                self.stream.subscribe_bars(self.bar_callback, symbol)
+            
+            logger.info(f"🚀 Streaming started for {len(self.symbols)} symbols")
+            logger.info(f"   Signal Threshold: {self.signal_threshold}")
+            
+            self.stats['connection_status'] = 'Streaming'
+            self.stream.run()
+            
+        except KeyboardInterrupt:
+            self.is_running = False
+            logger.info("\n🛑 Bot stopped by user")
+            bot_stop_alert("User interrupt")
+        except Exception as e:
+            logger.error(f"Stream error: {e}")
+            bot_error_alert(str(e))
+            self.stats['connection_status'] = 'Error'
+
+    def sync_positions(self):
+        try:
+            positions = self.api.list_positions()
+            
+            if positions:
+                logger.info("📊 Syncing existing positions...")
+            
+            for pos in positions:
+                symbol = pos.symbol
+                qty = int(float(pos.qty))
+                avg_entry = float(pos.avg_entry_price)
+                current_price = float(pos.current_price)
+                
+                if symbol in self.positions:
+                    self.positions[symbol]['qty'] = qty
+                    self.positions[symbol]['entry_price'] = avg_entry
+                    self.positions[symbol]['entry_time'] = datetime.now()
+                    self.positions[symbol]['highest_price'] = current_price
+                    self.positions[symbol]['type'] = 'LONG' if qty > 0 else None
+                    
+                    logger.info(f"✓ {symbol}: {qty} shares @ ${avg_entry:.2f}")
+                
+        except Exception as e:
+            logger.error(f"Position sync error: {e}")
+
+
+# ============================================================================
+# GRACEFUL SHUTDOWN HANDLER
+# ============================================================================
+
+bot_instance = None
+
+def signal_handler(signum, frame):
+    """Handle shutdown signals gracefully"""
+    logger.info("\n🛑 Shutdown signal received")
+    bot_stop_alert("Shutdown signal")
+    if bot_instance:
+        bot_instance.is_running = False
+    sys.exit(0)
+
+signal.signal(signal.SIGINT, signal_handler)
+signal.signal(signal.SIGTERM, signal_handler)
+
+
+# ============================================================================
+# MAIN FUNCTION
+# ============================================================================
+
+def run_aws_bot():
+    global bot_instance
+    
+    logger.info("=" * 80)
+    logger.info("🤖 ENHANCED EMA TRADING BOT - AWS EC2")
+    logger.info("=" * 80)
+    
+    bot_instance = LiveTradingBot(initial_capital=250000, risk_per_trade=0.01)
+    
+    if not bot_instance.api:
+        logger.error("❌ Cannot start bot - Alpaca connection failed")
+        bot_error_alert("Alpaca connection failed")
+        return
+    
+    # Send Discord start alert
+    bot_start_alert(bot_instance)
+    
+    # Sync existing positions
+    bot_instance.sync_positions()
+    
+    is_paper = "paper-api" in ALPACA_BASE_URL.lower()
+    mode = "📝 PAPER TRADING" if is_paper else "🔴 LIVE TRADING"
+    
+    logger.info(f"\nACCOUNT TYPE: {mode}")
+    logger.info(f"Market Status: {'🟢 OPEN' if bot_instance.is_market_hours() else '🔴 CLOSED'}")
+    
+    logger.info("\n" + "=" * 80)
+    logger.info("⚡ BOT CONFIGURATION")
+    logger.info("=" * 80)
+    logger.info(f"✓ Signal threshold: {bot_instance.signal_threshold}")
+    logger.info(f"✓ Stop Loss: {bot_instance.stop_loss*100:.1f}%")
+    logger.info(f"✓ Take Profit 1: {bot_instance.take_profit_1*100:.1f}%")
+    logger.info(f"✓ Take Profit 2: {bot_instance.take_profit_2*100:.1f}%")
+    logger.info(f"✓ Market hours filter: Active")
+    logger.info(f"✓ Discord alerts: Enabled")
+    logger.info(f"✓ Hourly updates: Every hour")
+    logger.info(f"✓ EOD summary: 8:00 PM ET")
+    logger.info("=" * 80)
+    logger.info("\n🚀 Starting bot in 3 seconds...")
+    logger.info("📱 Check Discord for alerts!")
+    logger.info("🛑 To stop: Ctrl+C or kill process")
+    logger.info("=" * 80)
+    
+    time.sleep(3)
+    
+    try:
+        bot_instance.start_streaming()
+    except Exception as e:
+        logger.error(f"Fatal error: {e}")
+        bot_error_alert(f"Fatal error: {e}")
+
+
+if __name__ == "__main__":
+    run_aws_bot()
