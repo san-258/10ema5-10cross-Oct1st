@@ -1,0 +1,267 @@
+# Key fixes for the trading bot issues
+
+# FIX 1: Proper market hours check
+def is_market_hours(self) -> bool:
+    """Fixed market hours check with proper timezone handling"""
+    try:
+        eastern = pytz.timezone('US/Eastern')
+        now_et = datetime.now(eastern)
+        
+        # Weekend check
+        if now_et.weekday() >= 5:
+            logger.info(f"Weekend detected: {now_et.strftime('%A')}")
+            return False
+        
+        # Market hours: 9:30 AM - 4:00 PM ET
+        market_open = now_et.replace(hour=9, minute=30, second=0, microsecond=0)
+        market_close = now_et.replace(hour=16, minute=0, second=0, microsecond=0)
+        
+        is_open = market_open <= now_et <= market_close
+        
+        if not is_open:
+            logger.debug(f"Outside market hours: {now_et.strftime('%H:%M:%S')} ET")
+        
+        return is_open
+    except Exception as e:
+        logger.error(f"Market hours check error: {e}")
+        return False  # Default to closed on error
+
+
+# FIX 2: Prevent duplicate positions
+async def bar_callback(self, bar):
+    """Fixed bar callback with proper position management"""
+    try:
+        symbol = bar.symbol
+        
+        # Update stats
+        self.last_activity_time = datetime.now()
+        self.total_bars_received += 1
+        self.stats['bars_per_symbol'][symbol] += 1
+        self.stats['last_price_per_symbol'][symbol] = bar.close
+        
+        # Track market hours bars
+        if self.is_market_hours():
+            self.stats['market_hours_bars'] += 1
+        else:
+            self.stats['after_hours_bars'] += 1
+        
+        # Store bar data
+        bar_data = {
+            'timestamp': bar.timestamp,
+            'open': bar.open,
+            'high': bar.high,
+            'low': bar.low,
+            'close': bar.close,
+            'volume': bar.volume
+        }
+        self.symbol_data[symbol].append(bar_data)
+        
+        # Calculate indicators
+        indicators = self.calculate_indicators(symbol)
+        if not indicators:
+            return
+        
+        current_price = bar.close
+        
+        # CRITICAL FIX: Check if we actually have a position
+        # Verify with Alpaca API, don't just trust internal state
+        try:
+            alpaca_position = self.api.get_position(symbol)
+            actual_qty = int(float(alpaca_position.qty))
+            
+            # Sync if out of sync
+            if actual_qty != self.positions[symbol]['qty']:
+                logger.warning(f"Position mismatch for {symbol}: Internal={self.positions[symbol]['qty']}, Alpaca={actual_qty}")
+                if actual_qty > 0:
+                    self.positions[symbol]['qty'] = actual_qty
+                    self.positions[symbol]['entry_price'] = float(alpaca_position.avg_entry_price)
+                    self.positions[symbol]['type'] = 'LONG'
+                else:
+                    self.positions[symbol]['qty'] = 0
+                    self.positions[symbol]['type'] = None
+        except:
+            # No position exists in Alpaca
+            if self.positions[symbol]['qty'] != 0:
+                logger.warning(f"Clearing phantom position for {symbol}")
+                self.positions[symbol]['qty'] = 0
+                self.positions[symbol]['type'] = None
+        
+        # Exit condition checks (24/7)
+        exit_reason = self.check_exit_conditions(symbol, current_price)
+        if exit_reason and self.positions[symbol]['qty'] > 0:
+            logger.info(f"🚪 EXIT SIGNAL: {symbol} - {exit_reason} @ ${current_price:.2f}")
+            
+            qty = abs(self.positions[symbol]['qty'])
+            order_id = self.place_order(symbol, qty, 'sell', current_price)
+            
+            if order_id:
+                trade_close_alert(symbol, current_price, exit_reason)
+                self.update_position(symbol, 0, current_price, 'sell')
+            return
+        
+        # Entry signals (market hours ONLY)
+        # CRITICAL FIX: Check both internal state AND Alpaca position
+        has_position = self.positions[symbol]['qty'] > 0
+        market_open = self.is_market_hours()
+        
+        if not has_position and market_open:
+            signal = self.generate_signal(symbol, indicators)
+            
+            if signal == 1:  # Buy signal
+                logger.info(f"📊 BUY SIGNAL: {symbol} @ ${current_price:.2f} during market hours")
+                
+                qty = self.calculate_position_size(symbol, current_price, indicators['ATR'])
+                
+                if qty > 0:
+                    # Double-check we don't have a position before placing order
+                    try:
+                        existing_pos = self.api.get_position(symbol)
+                        logger.warning(f"⚠️ Skipping {symbol} - already have position: {existing_pos.qty} shares")
+                        return
+                    except:
+                        # Good - no existing position
+                        pass
+                    
+                    order_id = self.place_order(symbol, qty, 'buy', current_price, indicators)
+                    if order_id:
+                        self.update_position(symbol, qty, current_price, 'buy')
+                else:
+                    logger.warning(f"Position size too small for {symbol}: {qty}")
+        elif has_position and market_open:
+            logger.debug(f"Skipping {symbol} - already have {self.positions[symbol]['qty']} shares")
+        elif not market_open:
+            logger.debug(f"Skipping {symbol} - market closed")
+        
+        # Hourly status
+        if (datetime.now() - self.last_hourly_alert).total_seconds() >= 3600:
+            hourly_status_alert(self)
+            self.last_hourly_alert = datetime.now()
+        
+        # EOD summary
+        schedule.run_pending()
+        
+    except Exception as e:
+        logger.error(f"Bar callback error for {symbol}: {e}", exc_info=True)
+
+
+# FIX 3: Raise signal threshold to prevent overtrading
+def __init__(self, initial_capital=250000, risk_per_trade=0.01):
+    """Initialize with safer parameters"""
+    self.initial_capital = initial_capital
+    self.risk_per_trade = risk_per_trade
+    self.max_position_size = initial_capital * 0.15
+    
+    # Risk management
+    self.stop_loss = 0.008
+    self.take_profit_1 = 0.015
+    self.take_profit_2 = 0.025
+    self.trailing_stop = 0.005
+    
+    # CRITICAL FIX: Increase threshold to reduce false signals
+    self.signal_threshold = 6  # Changed from 4 to 6
+    
+    # ... rest of initialization
+
+
+# FIX 4: Add trade cooldown to prevent rapid-fire trades
+def __init__(self, initial_capital=250000, risk_per_trade=0.01):
+    # ... existing code ...
+    
+    # Add cooldown tracking
+    self.last_trade_time = {}
+    self.trade_cooldown_seconds = 300  # 5 minutes between trades per symbol
+    
+    for symbol in self.symbols:
+        self.last_trade_time[symbol] = datetime.min
+
+
+async def bar_callback(self, bar):
+    # ... existing code up to entry signals ...
+    
+    if not has_position and market_open:
+        signal = self.generate_signal(symbol, indicators)
+        
+        if signal == 1:
+            # Check cooldown
+            time_since_last_trade = (datetime.now() - self.last_trade_time[symbol]).total_seconds()
+            
+            if time_since_last_trade < self.trade_cooldown_seconds:
+                logger.info(f"⏳ Cooldown active for {symbol}: {int(self.trade_cooldown_seconds - time_since_last_trade)}s remaining")
+                return
+            
+            logger.info(f"📊 BUY SIGNAL: {symbol} @ ${current_price:.2f}")
+            
+            # ... rest of order placement ...
+            
+            # Update cooldown
+            self.last_trade_time[symbol] = datetime.now()
+
+
+# FIX 5: Better order confirmation
+def place_order(self, symbol: str, qty: int, side: str, current_price: float, indicators: Dict = None) -> Optional[str]:
+    """Enhanced order placement with confirmation"""
+    try:
+        if qty <= 0:
+            logger.warning(f"Invalid quantity for {symbol}: {qty}")
+            return None
+        
+        # Check if we already have a pending order
+        if symbol in self.pending_orders:
+            logger.warning(f"Pending order exists for {symbol}, skipping")
+            return None
+        
+        logger.info(f"📤 PLACING ORDER: {side.upper()} {qty} {symbol} @ ~${current_price:.2f}")
+        
+        order = self.api.submit_order(
+            symbol=symbol,
+            qty=qty,
+            side=side,
+            type='market',
+            time_in_force='day'
+        )
+        
+        logger.info(f"✅ ORDER SUBMITTED: {order.id} for {symbol}")
+        
+        self.total_trades_executed += 1
+        self.stats['trades_per_symbol'][symbol] += 1
+        
+        self.pending_orders[symbol] = {
+            'order_id': order.id,
+            'side': side,
+            'qty': qty,
+            'price': current_price,
+            'timestamp': datetime.now()
+        }
+        
+        # Wait briefly for fill
+        time.sleep(2)
+        
+        # Check order status
+        try:
+            order_status = self.api.get_order(order.id)
+            if order_status.status == 'filled':
+                filled_price = float(order_status.filled_avg_price)
+                logger.info(f"✅ ORDER FILLED: {symbol} @ ${filled_price:.2f}")
+                
+                # Remove from pending
+                if symbol in self.pending_orders:
+                    del self.pending_orders[symbol]
+                
+                # Send alert with actual fill price
+                if side.lower() == 'buy':
+                    trade_open_alert(symbol, side, filled_price, qty, indicators)
+                
+                return order.id
+            else:
+                logger.warning(f"⏳ Order {order.id} status: {order_status.status}")
+                return order.id
+                
+        except Exception as e:
+            logger.error(f"Could not verify order status: {e}")
+            return order.id
+        
+    except Exception as e:
+        logger.error(f"❌ ORDER FAILED for {symbol}: {e}")
+        if symbol in self.pending_orders:
+            del self.pending_orders[symbol]
+        return None
