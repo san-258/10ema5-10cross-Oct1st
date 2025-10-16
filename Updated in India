@@ -25,12 +25,14 @@ import schedule
 warnings.filterwarnings('ignore')
 
 # ============================================================================
-# CONFIGURATION
+# CONFIGURATION - PUT YOUR CREDENTIALS HERE
 # ============================================================================
-ALPACA_API_KEY = os.environ.get("ALPACA_API_KEY", "YOUR_KEY_HERE")
-ALPACA_SECRET_KEY = os.environ.get("ALPACA_SECRET_KEY", "YOUR_SECRET_HERE")
-ALPACA_BASE_URL = os.environ.get("ALPACA_BASE_URL", "https://paper-api.alpaca.markets")
-DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL", "YOUR_WEBHOOK_HERE")
+ALPACA_API_KEY = "PK4SNFKPNS485S0LRZ0Y"
+ALPACA_SECRET_KEY = "Zt1mZLm3GANReXk21h0krQqRRdl83WGhUONHHz2C"
+ALPACA_BASE_URL = "https://paper-api.alpaca.markets"  # Use paper trading
+
+DISCORD_WEBHOOK_URL = "https://discord.com/api/webhooks/1423311843019194450/_7q91XG0OA6q7Ctdoyr3WZzdTPo1KjH6XUtjC18jSYQMHOiXjWqM5Dq-sRXyHEofjjcW"
+# ============================================================================
 
 # ============================================================================
 # LOGGING
@@ -63,7 +65,7 @@ daily_trades = []
 
 def send_discord_embed(message, title="Trading Bot", color=3447003, fields=None):
     """Send rich embed to Discord"""
-    if not DISCORD_WEBHOOK_URL or DISCORD_WEBHOOK_URL == "YOUR_WEBHOOK_HERE":
+    if not DISCORD_WEBHOOK_URL:
         return
     
     embed = {
@@ -313,10 +315,6 @@ class LiveTradingBot:
             return
         
         try:
-            if not ALPACA_API_KEY or ALPACA_API_KEY == "YOUR_KEY_HERE":
-                logger.error("❌ Missing Alpaca credentials")
-                return
-            
             self.api = tradeapi.REST(
                 key_id=ALPACA_API_KEY,
                 secret_key=ALPACA_SECRET_KEY,
